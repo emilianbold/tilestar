@@ -1,0 +1,4 @@
+tilelang_version=0.1.15
+tilelang_commit=c31aab31da91ee1cbf67ee888de5893f21a05924
+targets=metal,c
+generator_sha256=59fd0dc007e9bc8904e67425b16076625d331ddcd3c6dd767e4485e5fa04e1b4

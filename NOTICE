@@ -1,0 +1,24 @@
+NOTICE
+======
+
+This product is a demo branch of DwarfStar (ds4), based on
+https://github.com/antirez/ds4 at commit
+0aaea5a238fb41a35106a551e73c8409dfb751ac.
+
+The project code is under the MIT license; see the LICENSE file.
+The TileLang-generated kernel sources in gen/ are produced by this
+project's own generator (tilelang-kernels/) and carry the same license.
+
+Components added by this branch are included under their own licenses:
+
+* puff.c, puff.h — a minimal inflate (decompression) implementation
+  by Mark Adler, from the zlib project's contrib/puff
+  (https://github.com/madler/zlib). Zlib license; the complete notice
+  is retained at the top of puff.h and puff.c. Used to inflate the
+  embedded Metal kernel source at startup.
+
+* third_party/tilelang/ — vendored TileLang C++ template headers
+  (tl_templates/cpp/common.h, half.hpp) included by the
+  TileLang-generated CPU reference kernels in gen/cpu/. MIT license,
+  Copyright (c) Tile-AI; half.hpp is MIT, Copyright (c) Christian Rau.
+  See third_party/tilelang/LICENSE and third_party/tilelang/VENDOR.md.
