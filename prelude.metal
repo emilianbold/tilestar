@@ -38,25 +38,6 @@ kernel void kernel_touch_u8_stride(
     dst[dst_offset + (ulong)gid] = src[off];
 }
 
-// Gate-time prefetch: one dispatch over up to 8 ranges given as GPU
-// addresses (bindless views over the model), 128 B per thread, ranges
-// assigned by cumulative line counts.  One launch instead of one per
-// range: the fixed cost per dispatch is what a rank pays when its peer's
-// partial is already there.
-kernel void kernel_touch_u8_stride_table(
-        constant ulong        *addr       [[buffer(0)]],
-        constant uint         *lines      [[buffer(1)]],
-        constant uint         &count      [[buffer(2)]],
-        device uchar          *dst        [[buffer(3)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint line = gid;
-    uint i = 0;
-    while (i < count && line >= lines[i]) { line -= lines[i]; i++; }
-    if (i >= count) return;
-    device const uchar *src = (device const uchar *)addr[i];
-    dst[gid] = src[(ulong)line * 128ul];
-}
-
 enum ds4_sort_order {
     DS4_SORT_ORDER_ASC,
     DS4_SORT_ORDER_DESC,
@@ -73,13 +54,11 @@ struct block_q8_K {
     int16_t bsums[QK_K / 16];
 };
 
-/* TP keepalive (moved here from upstream metal/dsv4_misc.metal when the
- * hand-written kernel sources left this branch): back-to-back on a side
- * queue while TP decode runs.  The per-layer gate stalls make the real
- * workload look idle to the GPU power manager, which otherwise halves
- * the clocks within a second (~2x decode regression); this holds them up
- * for negligible bandwidth and a few watts. */
-kernel void kernel_dsv4_tp_keepalive(
+/* GPU keepalive: back-to-back on a side queue while decode runs. Gaps
+ * between command buffers make the real workload look idle to the GPU power
+ * manager, which otherwise drops the clocks within a second; this holds them
+ * up for negligible bandwidth and a few watts. */
+kernel void kernel_gpu_keepalive(
         device float * out,
         constant uint & iters,
         uint tid [[thread_position_in_grid]]) {

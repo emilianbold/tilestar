@@ -180,7 +180,7 @@ int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
 int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier);
 int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int dst_tier);
 
-/* Cross-device float add used by CUDA tensor-parallel reductions.
+/* Cross-device float add.
  * See ds4_gpu.h for the full contract. */
 int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor       *out,
                              const ds4_gpu_tensor *local,

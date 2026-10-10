@@ -118,7 +118,7 @@ Targets:
 
   ds4f-vision-mxfp4
        Native MXFP4 Vision Experimental model, about 145 GiB, plus its vision
-       encoder. Intended for CUDA or two 128 GB Macs using tensor parallelism.
+       encoder. Intended for CUDA or larger resident Macs.
 
   ds4f-vision-encoder
        Standalone Vision Experimental encoder, about 0.9 GiB. Use this when
@@ -131,7 +131,7 @@ Targets:
   ds41f-q2
        DeepSeek V4.1 Flash calibrated Q2, about 341 GiB on disk. Main weights
        occupy 152 GiB; Engram tables stay on disk. Metal only: use SSD streaming
-       on one 128 GB Mac, tensor parallelism on two, or a larger resident Mac.
+       on one 128 GB Mac, or a larger resident Mac.
 
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
@@ -185,8 +185,8 @@ Targets:
        resident inference on 128 GB Macs.
 
   glm53-q4
-       GLM 5.3 Flash Q4_K GGUF, about 178 GiB on disk. Intended for two-Mac
-       tensor parallelism or single-Mac SSD streaming.
+       GLM 5.3 Flash Q4_K GGUF, about 178 GiB on disk. Intended for
+       single-Mac SSD streaming.
 
   glm53-fp8
        Text-only GLM 5.3 Flash native FP8 GGUF, about 305 GiB on disk. It

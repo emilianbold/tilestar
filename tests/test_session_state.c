@@ -189,46 +189,6 @@ static void test_session_memory(void) {
     assert(ds4_engine_glm_graph_budget(&e, 2*gib) == 8*gib);
 }
 
-static void test_payload_tokens(void) {
-    FILE *fp = tmpfile();
-    assert(fp);
-    char err[256] = "";
-    const uint32_t ids[] = {71, 19, 900, 4};
-    for (size_t i = 0; i < 4; i++)
-        assert(payload_write_u32(fp, ids[i], err, sizeof(err)) == 0);
-    /* Opaque cache bytes are skipped, but the caller's trailer stays unread. */
-    for (int i = 0; i < 65539; i++) assert(fputc('x', fp) != EOF);
-    const long end = ftell(fp);
-    assert(fputs("TRAILER", fp) >= 0);
-    rewind(fp);
-    ds4_tokens tokens = {0};
-    assert(payload_read_tokens_for_rebuild(fp, 4, end,
-                                           &tokens, err, sizeof(err)) == 0);
-    assert(tokens.len == 4);
-    for (int i = 0; i < 4; i++) assert(tokens.v[i] == (int)ids[i]);
-    assert(ftell(fp) == end && fgetc(fp) == 'T');
-    ds4_tokens_free(&tokens);
-    rewind(fp);
-    assert(payload_read_tokens_for_rebuild(fp, 4, 15,
-                                           &tokens, err, sizeof(err)) != 0);
-    assert(ftell(fp) == 0 && tokens.len == 0);
-    assert(payload_read_tokens_for_rebuild(fp, 0, end,
-                                           &tokens, err, sizeof(err)) != 0);
-    rewind(fp);
-    assert(payload_write_u32(fp, DS4_N_VOCAB, err, sizeof(err)) == 0);
-    rewind(fp);
-    assert(payload_read_tokens_for_rebuild(fp, 4, end,
-                                           &tokens, err, sizeof(err)) != 0);
-    assert(tokens.len == 0);
-    rewind(fp);
-    assert(payload_write_u32(fp, ids[0], err, sizeof(err)) == 0);
-    rewind(fp);
-    assert(payload_read_tokens_for_rebuild(fp, 4, end + 8,
-                                           &tokens, err, sizeof(err)) != 0);
-    ds4_tokens_free(&tokens);
-    fclose(fp);
-}
-
 static void test_snapshot_bytes(void) {
     const ds4_shape saved_shape = g_ds4_shape;
     const uint32_t saved_ratio = g_ds4_compress_ratios[0];
@@ -534,7 +494,6 @@ int main(void) {
     test_vision_fingerprint_prefix();
     test_rewind();
     test_session_memory();
-    test_payload_tokens();
     test_snapshot_bytes();
     test_text_observations();
 #ifndef DS4_NO_GPU

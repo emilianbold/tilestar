@@ -4907,9 +4907,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
 
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
-        /* A saved payload contains only the leader's graph state. Rebuild from
-         * rendered text under TP so session_sync mirrors the same token prefix
-         * to the worker before either rank resumes decoding. */
+        /* No saved graph payload: rebuild the session from the rendered text. */
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;

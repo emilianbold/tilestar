@@ -95,39 +95,6 @@ typedef struct {
     bool debug;
 } ds4_distributed_options;
 
-/* Tensor parallelism: two identical machines run the model in lockstep and
- * split the heavy per-layer matvecs, exchanging partial sums at gates inside
- * the graph (see misc/METAL_TENSOR_PARALLELISM.md).  Each rank keeps one
- * contiguous half of the routed experts resident; dense and shared weights
- * remain replicated.  The leader owns prompt/sampling and listens; the worker
- * dials in and mirrors every session sync/eval. */
-typedef enum {
-    DS4_TP_NONE = 0,
-    DS4_TP_LEADER,
-    DS4_TP_WORKER,
-} ds4_tp_role;
-
-typedef enum {
-    DS4_TP_TRANSPORT_AUTO = 0,
-    DS4_TP_TRANSPORT_RDMA,
-    DS4_TP_TRANSPORT_TCP,
-} ds4_tp_transport;
-
-typedef struct {
-    ds4_tp_role role;
-    bool requested;             /* --tensor-parallel with shared role options */
-    const char *listen_host;    /* leader listens here for the worker */
-    int listen_port;
-    const char *leader_host;    /* worker dials the leader */
-    int leader_port;
-    ds4_tp_transport transport;
-    const char *rdma_device;
-    int rdma_gid_index;
-    bool rdma_gid_index_set;
-    bool glm_token_prefill;
-    int debug_hash;             /* cross-check hidden state every N tokens */
-} ds4_tp_options;
-
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -157,7 +124,6 @@ typedef struct {
     bool dspark_strict;
     bool dspark_exact_sampling;
     bool dspark_confidence_threshold_set;
-    bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -175,7 +141,6 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     ds4_distributed_options distributed;
-    ds4_tp_options tp;
 } ds4_engine_options;
 
 typedef struct {
@@ -250,13 +215,6 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
-/* Decode gate schedule for the TP transport; see ds4_tp_identity. */
-enum { DS4_TP_GATE_MASK_WORDS = 3 };
-void ds4_engine_tp_gate_schedule(ds4_engine *e,
-                                 uint32_t *start,
-                                 uint32_t *step,
-                                 uint32_t *per_token,
-                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
@@ -292,7 +250,6 @@ int ds4_chat_append_multimodal_message(ds4_engine *e,
                                        ds4_vision_span *spans,
                                        char *error,
                                        size_t error_cap);
-int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
                                         uint32_t full_live,
@@ -392,16 +349,6 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
-
-/* Tensor-parallel binding: allocates the GPU gate slab, registers it with
- * the transport and arms the per-layer gate machinery.  Call once, after
- * ds4_tp_create() and before any session work.  Transport lifecycle stays
- * with the caller. */
-struct ds4_tp;
-int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
-/* Release gate resources before freeing a bound transport. Sessions must
- * already be closed. Also called by ds4_engine_close(). */
-void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
@@ -529,7 +476,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 /* Pay the one-time first-submission GPU cost outside any measured window;
- * used by the TP worker right after session create (no-op on CPU/GLM). */
+ * no-op on CPU/GLM. Call right after session create. */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 
@@ -577,13 +524,6 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float temperature, int top_k,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
-                                 char *err, size_t errlen);
-/* TP worker side of a mirrored speculative-verify block: run its half of the
- * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
-int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
-                              char *err, size_t errlen);
-int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 /* Keep the token prefix, restoring recurrent state where possible. Otherwise

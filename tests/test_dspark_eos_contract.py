@@ -49,14 +49,11 @@ PRELUDE = r'''
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
 #define DS4_SPEC_PREFIX_SLOTS 4
 #define DS4_N_VOCAB 16
-#define DS4_TP_VERIFY_COMMIT_FULL 1
-#define DS4_TP_VERIFY_COMMIT_PREFIX 2
-#define DS4_TP_VERIFY_ROLLBACK_REPLAY 3
 enum { DS4_BACKEND_METAL, DS4_BACKEND_CUDA, DS4_BACKEND_CPU };
 typedef int ds4_think_mode;
 typedef struct { int len, data[64]; } ds4_tokens;
 typedef struct { int frontier; } ds4_gpu_graph;
-typedef struct { int model, weights, backend; struct { void *ctx; bool vocab_split; } tp; } ds4_engine;
+typedef struct { int model, weights, backend; } ds4_engine;
 typedef struct {
     double upload_ms, layer_ms, head_ms, read_ms;
     bool fused_head;
@@ -64,7 +61,7 @@ typedef struct {
 typedef struct {
     ds4_engine *engine; ds4_tokens checkpoint; ds4_gpu_graph graph;
     bool dspark_draft_valid, checkpoint_valid; uint32_t dspark_draft_len;
-    int dspark_draft_tokens[16], ctx_size, tp_session_id;
+    int dspark_draft_tokens[16], ctx_size;
     float logits[DS4_N_VOCAB], *spec_row_logits;
     double dspark_last_propose_ms;
     struct { STATS_FIELDS } dspark_stats;
@@ -72,8 +69,8 @@ typedef struct {
 typedef struct { int frontier; } ds4_spec_frontier;
 static int verified_width, verified_start, verified_tokens[16], target_next[16];
 static int selected_row, prefix_committed, replayed, capture_notes, mock_errors;
-static int tp_width, tp_tokens[16], tp_commit_kind, tp_commit_count, capture_prefix_calls;
-static bool tp_leader, seed_batch, fail_prefix, fail_read, fail_verify, prefixes_captured;
+static int capture_prefix_calls;
+static bool seed_batch, fail_prefix, fail_read, fail_verify, prefixes_captured;
 static int extra_stop = -1;
 static bool ds4_dspark_stats_enabled(void) { return true; }
 static bool ds4_dspark_scheduler_enabled(ds4_session *s) { (void)s; return false; }
@@ -102,18 +99,6 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f,ds4_session *s) {
 static void spec_frontier_free(ds4_spec_frontier *f) { (void)f; }
 static bool spec_frontier_restore(ds4_spec_frontier *f,ds4_session *s) {
     s->graph.frontier=f->frontier; return true;
-}
-static bool ds4_session_tp_leader(ds4_session *s) { (void)s; return tp_leader; }
-static int ds4_tp_send_verify(void *ctx,int id,const int *drafts,uint32_t n) {
-    (void)ctx; (void)id;
-    if(n==0 || n>16) { mock_errors++; return 0; }
-    memcpy(tp_tokens,drafts,(size_t)n*sizeof(*drafts)); tp_width=(int)n; return 1;
-}
-static int ds4_tp_send_verify_commit(void *ctx,int kind,int count) {
-    (void)ctx; tp_commit_kind=kind; tp_commit_count=count; return 1;
-}
-static int ds4_tp_recv_logits_half(void *ctx,float *p,uint32_t n) {
-    (void)ctx; (void)p; (void)n; mock_errors++; return 0;
 }
 static bool metal_graph_verify_suffix_tops(ds4_gpu_graph *g,int *m,int *w,ds4_tokens *tokens,
         uint32_t start,uint32_t n,bool capture,bool keep,int *tops,void *unused,
@@ -193,8 +178,8 @@ static void setup(const int *draft,int n,int seed,int reject) {
     if(reject==0) { for(int i=0;i<DS4_N_VOCAB;i++) session.logits[i]=-100; session.logits[15]=100; }
     if(reject>0) target_next[reject-1]=15;
     verified_width=verified_start=prefix_committed=replayed=capture_notes=mock_errors=0;
-    tp_width=tp_commit_kind=tp_commit_count=capture_prefix_calls=0;
-    selected_row=-1; seed_batch=(seed==0); tp_leader=false;
+    capture_prefix_calls=0;
+    selected_row=-1; seed_batch=(seed==0);
     fail_prefix=fail_read=fail_verify=prefixes_captured=false; extra_stop=-1;
 }
 static int invoke(int max_tokens,int cap,bool ignore) {
@@ -218,17 +203,6 @@ static void check_frontier(int returned,int expected,int width,const int *draft,
         for(int i=0;i<DS4_N_VOCAB;i++) CHECK(isfinite(session.logits[i]) && session.logits[i]==(float)((start+expected)*100+i));
         CHECK(capture_notes==1);
     }
-    if(tp_leader) {
-        CHECK(tp_width==width);
-        for(int i=0;i<width;i++) CHECK(tp_tokens[i]==draft[i]);
-        if(expected==width && width) CHECK(tp_commit_kind==DS4_TP_VERIFY_COMMIT_FULL);
-        if(expected<width && expected && prefix_committed) {
-            CHECK(tp_commit_kind==DS4_TP_VERIFY_COMMIT_PREFIX && tp_commit_count==expected);
-        }
-        if(expected<width && expected && !prefix_committed) {
-            CHECK(tp_commit_kind==DS4_TP_VERIFY_ROLLBACK_REPLAY && tp_commit_count==expected);
-        }
-    }
     cases++;
 }
 int main(void) {
@@ -248,11 +222,10 @@ int main(void) {
         int draft[16]; for(int i=0;i<n;i++) draft[i]=3+(i%12);
         if(eos>=0) draft[eos]=1;
         setup(draft,n,seed,reject);
-        tp_leader=(seed==1 && (reject%2)==0);
         int bounded=eos<0 ? n : eos+(ignore ? 0 : 1);
         int expected=(reject>=0 && reject<bounded) ? reject : bounded;
         int width=(bounded==0 || reject==0) ? 0 : bounded;
-        label="EOS positions, seed/ordinary, ignore, partial and TP";
+        label="EOS positions, seed/ordinary, ignore and partial";
         int previous_failures=failures;
         returned=invoke(18,18,ignore!=0);
         check_frontier(returned,expected,width,draft,18);
@@ -330,9 +303,9 @@ def main():
         c.write_text(code)
         command = compiler + ['-std=c11', '-O0', '-fno-fast-math', '-Wall', '-Wextra', '-Werror', str(c), '-lm', '-o', str(binary)]
         build = subprocess.run(command, capture_output=True, text=True, timeout=60)
-        report = {'scope': 'actual extracted greedy verifier function; checked host target/TP mocks, no model or GPU arithmetic',
+        report = {'scope': 'actual extracted greedy verifier function; checked host target mocks, no model or GPU arithmetic',
                   'tested_draft_widths': [1, 16], 'production_max_block_size': 16,
-                  'coverage_limits': 'Public caller selection, proposal kernels, GPU arithmetic, physical KV state, actual TP worker execution and stochastic helper execution are not mocked as proven.',
+                  'coverage_limits': 'Public caller selection, proposal kernels, GPU arithmetic, physical KV state and stochastic helper execution are not mocked as proven.',
                   'source': str(args.source.resolve()), 'source_sha256': hashlib.sha256(raw).hexdigest(),
                   'helper_sha256': hashlib.sha256(function.encode()).hexdigest(),
                   'test_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

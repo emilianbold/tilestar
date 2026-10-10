@@ -97,68 +97,7 @@ int ds4_gpu_parallel_ffn_start(
         uint32_t              shared_dim,
         const ds4_gpu_tensor *x,
         float                 clamp);
-int ds4_gpu_parallel_ffn_start_sliced(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *shared_out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              gate_offset,
-        uint64_t              up_offset,
-        uint64_t              down_offset,
-        uint32_t              model_dim,
-        uint32_t              shared_dim,
-        uint32_t              shared_lane_offset,
-        uint32_t              shared_lane_count,
-        const ds4_gpu_tensor *x,
-        float                 clamp);
 
-/* GPU-decided shared-expert lane split for two-rank TP decode: the split
- * kernels read the selected expert ids and take complementary lane ranges
- * sized to balance the bytes each rank streams (shift_q16 = routed expert
- * bytes / (2 * shared expert bytes) in Q16; 0 reproduces static halves). */
-int ds4_gpu_parallel_ffn_start_split(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *shared_out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              gate_offset,
-        uint64_t              up_offset,
-        uint64_t              down_offset,
-        uint32_t              model_dim,
-        uint32_t              shared_dim,
-        const ds4_gpu_tensor *x,
-        float                 clamp,
-        const ds4_gpu_tensor *selected,
-        uint32_t              tp_rank,
-        uint32_t              tp_world,
-        uint32_t              n_expert,
-        uint32_t              n_expert_used,
-        uint32_t              shift_q16);
-
-/* out = a + b into this rank's TP slab slot for (layer, gate), publishing the
- * gate's checked flag from the same kernel; falls back to ds4_gpu_add_tensor
- * when the fold does not apply.  Call right before ds4_gpu_tp_gate_encode. */
-int ds4_gpu_add_tensor_tp_flag(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *a,
-        const ds4_gpu_tensor *b,
-        uint32_t              n,
-        uint32_t              layer,
-        uint32_t              gate);
-
-/* Register that the next TP partial producer for (layer, gate) may publish
- * the gate's checked flag itself (taken by the attention output K-slice
- * matvec when its output is that slot; otherwise ignored). */
-void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
-
-/* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
- * to run only its q task now and fold the kv task into the KV staging
- * kernel of the same layer; flush runs it standalone if nothing consumed it. */
-void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
 int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
@@ -426,77 +365,8 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
-#include "ds4_gpu_tp.h"
-/* Skip the whole-file model residency set (TP sharding: only the
- * owned ranges are warmed; the rest must never be paged in). Call before
- * the model is mapped. */
-void ds4_gpu_model_residency_skip(int skip);
 /* Submit one trivial command buffer (first-submission costs paid at load). */
 int ds4_gpu_warm_command_queue(void);
-
-/* Tensor-parallel sliced projections (Metal decode path only).
- *
- * ds4_gpu_matmul_q8_0_kslice_tensor computes a k-range partial matvec:
- * out[out_dim] = W[:, k_off : k_off + k_cnt] @ x[x_elem_off : +k_cnt] where
- * W rows span full_in_dim quantized Q8_0 elements.  k offsets/counts must be
- * multiples of 32 (Q8_0 block).  Partial results from both ranks sum to the
- * full projection.
- *
- * ds4_gpu_attention_output_q8_tp_tensor is the group-sliced attention output
- * pair: low projection for groups [group0, group0+group_cnt) plus the
- * matching k-slice of the expand projection, producing this rank's partial
- * attention block output (n_tokens == 1 only). */
-int ds4_gpu_matmul_q8_0_kslice_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                full_in_dim,
-        uint64_t                k_off,
-        uint64_t                k_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off);
-/* CUDA input rows contain only the owned contiguous K slice. Metal input
- * rows span full_in_dim and the kernel reads the slice at k_off within them.
- * Both backends produce full-width output rows. */
-int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
-        ds4_gpu_tensor       *out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              full_in_dim,
-        uint64_t              out_dim,
-        uint64_t              k_off,
-        uint64_t              k_cnt,
-        const ds4_gpu_tensor *x,
-        uint64_t              n_rows);
-int ds4_gpu_matmul_quant_kslice_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                weight_type,
-        uint64_t                full_in_dim,
-        uint64_t                k_off,
-        uint64_t                k_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off);
-int ds4_gpu_attention_output_q8_tp_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups_total,
-        uint32_t                group0,
-        uint32_t                group_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.
@@ -545,6 +415,21 @@ int ds4_gpu_embed_tokens_q8_0_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd);
+
+/* Partial matvec over a K range of the weight rows: out[out_dim] =
+ * W[:, k_off : k_off + k_cnt] @ x[x_elem_off : +k_cnt]. k_off and k_cnt must
+ * be multiples of 32 (one Q8_0 block). */
+int ds4_gpu_matmul_q8_0_kslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                full_in_dim,
+        uint64_t                k_off,
+        uint64_t                k_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                x_elem_off);
 
 int ds4_gpu_embed_token_quant_tensor(
         ds4_gpu_tensor *out,
@@ -2305,9 +2190,7 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                head_dim);
 
 /* Rectangular raw prefill attention: q is a view of the n_q query rows at
- * token positions [q_row0, q_row0 + n_q) of the chunk, raw_kv keeps all
- * n_kv rows, heads receives n_q output rows.  Used by the TP prefill row
- * split; the square entry above is the q_row0 = 0, n_q = n_kv case. */
+ * token positions [q_row0, q_row0 + n_q); raw_kv keeps all n_kv rows. */
 int ds4_gpu_attention_prefill_raw_heads_range_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -2412,11 +2295,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* Rectangular static-mixed prefill attention: q is a view of the n_q query
- * rows at token positions [q_row0, q_row0 + n_q) of the chunk, while raw_kv
- * keeps all n_tokens rows and comp_kv all n_comp compressed keys.  Used by
- * the TP prefill row split; the square entry above is q_row0 = 0,
- * n_q = n_tokens. */
+/* Rectangular static-mixed prefill attention (see the raw range entry). */
 int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -2558,21 +2437,6 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         uint32_t                group_cnt,
         const ds4_gpu_tensor *heads,
         uint32_t                n_rows);
-
-int ds4_gpu_attention_output_q8_tp_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups_total,
-        uint32_t                group0,
-        uint32_t                group_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads);
 
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
@@ -2800,112 +2664,6 @@ void ds4_gpu_set_dspark_verify_mode(bool enabled);
 int ds4_gpu_device_is_spark(void);
 #endif
 
-int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        uint64_t              in_start,
-        uint64_t              in_count,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t              n_embd,
-        uint32_t              n_hc);
-
-int ds4_gpu_routed_moe_one_owned_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *experts,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              gate_offset,
-        uint64_t              up_offset,
-        uint64_t              down_offset,
-        uint32_t              gate_type,
-        uint32_t              down_type,
-        uint64_t              gate_expert_bytes,
-        uint64_t              gate_row_bytes,
-        uint64_t              down_expert_bytes,
-        uint64_t              down_row_bytes,
-        uint32_t              expert_in_dim,
-        uint32_t              expert_mid_dim,
-        uint32_t              out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_total_expert,
-        uint32_t              n_expert,
-        uint32_t              resident_expert_base,
-        uint32_t              resident_expert_count,
-        float                 clamp,
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor       *down_output,
-        bool                  pack_fixed3,
-        ds4_gpu_tensor       *shared_prequant);
-
-int ds4_gpu_routed_moe_batch_owned_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        ds4_gpu_tensor       *experts,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              gate_offset,
-        uint64_t              up_offset,
-        uint64_t              down_offset,
-        uint32_t              gate_type,
-        uint32_t              down_type,
-        uint64_t              gate_expert_bytes,
-        uint64_t              gate_row_bytes,
-        uint64_t              down_expert_bytes,
-        uint64_t              down_row_bytes,
-        uint32_t              expert_in_dim,
-        uint32_t              expert_mid_dim,
-        uint32_t              out_dim,
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *weights,
-        uint32_t              n_total_expert,
-        uint32_t              n_expert,
-        uint32_t              resident_expert_base,
-        uint32_t              resident_expert_count,
-        float                 clamp,
-        const ds4_gpu_tensor *x,
-        uint32_t              layer_index,
-        uint32_t              n_tokens,
-        bool                 *mid_is_f16);
-
-int ds4_gpu_routed_moe_owned_slots_combine_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t              out_dim,
-        uint32_t              expert_split);
-
-int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t              out_dim,
-        uint32_t              expert_split,
-        uint32_t              rows);
-
-int ds4_gpu_routed_moe_owned_packed_combine_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t              out_dim,
-        uint32_t              expert_split);
-
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -3080,31 +2838,6 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         float                 eps,
         float                 hc_eps,
         float                 norm_eps);
-int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
-        ds4_gpu_tensor       *mix,
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *norm_out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_prev,
-        const ds4_gpu_tensor *post,
-        const ds4_gpu_tensor *comb,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              mix_weight_offset,
-        uint64_t              scale_offset,
-        uint64_t              base_offset,
-        uint64_t              norm_weight_offset,
-        uint32_t              n,
-        uint32_t              mix_dim,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              sinkhorn_iters,
-        float                 eps,
-        float                 hc_eps,
-        float                 norm_eps);
 
 #endif
 int ds4_gpu_output_hc_weights_tensor(
@@ -3125,26 +2858,7 @@ int ds4_gpu_hc_expand_tensor(
         const ds4_gpu_tensor *comb,
         uint32_t                n_embd,
         uint32_t                n_hc);
-int ds4_gpu_hc_expand_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *post,
-        const ds4_gpu_tensor *comb,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
 
-
-int ds4_gpu_hc_expand_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *post,
-        const ds4_gpu_tensor *comb,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
 
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -3206,24 +2920,6 @@ int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         const ds4_gpu_tensor *shared_mid,
         const ds4_gpu_tensor *routed_out,
         const ds4_gpu_tensor *routed_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
-int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t                expert_split,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
@@ -3440,7 +3136,7 @@ int ds4_gpu_glm53_kda_prefill(
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
-    uint32_t island;    /* 0: layer top; 1: FFN tail; 2: V4.1 TP attn-out */
+    uint32_t island;    /* 0: layer top; 1: FFN tail */
     uint32_t variant;
     uint32_t _pad;
     void    *cur_hc;

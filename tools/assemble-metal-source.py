@@ -85,7 +85,7 @@ def main():
     opens = len(re.findall(r'^\s*#(if|ifdef|ifndef)\b', src, re.M))
     closes = len(re.findall(r'^\s*#endif\b', src, re.M))
     assert opens == closes, f'preprocessor imbalance: {opens} vs {closes}'
-    for k in ('kernel_touch_u8_stride', 'kernel_dsv4_tp_keepalive'):
+    for k in ('kernel_touch_u8_stride', 'kernel_gpu_keepalive'):
         assert f'kernel void {k}(' in src, k
 
     open(out_path, 'w').write(src)

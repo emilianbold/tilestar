@@ -87,14 +87,16 @@ benefits.
 
 The size comes from compiling features out and letting the linker drop them
 (LTO plus `-ffunction-sections -fdata-sections` and `-Wl,-dead_strip`): other
-models, vision, Engram, SSD streaming, distributed mode and tensor parallelism,
-the CPU reference path, and the help text of the server. Code that only other
-models or removed features used is deleted where it was cleanly separable; a few
-one-line stubs and declarations keep the rest compiling.
+models, vision, Engram, SSD streaming, distributed mode, the CPU reference path,
+and the help text of the server. Code that only other models or removed
+features used is deleted where it was cleanly separable; a few one-line stubs
+and declarations keep the rest compiling. Tensor parallelism (two-Mac lockstep,
+the RDMA/TCP transport, sliced projections and their GPU gates) is deleted
+outright.
 
 TileLang kernels are always preferred at dispatch time. Every real op in the
 server flow on this machine, including DSpark, is TileLang-covered: the only
-hand-written kernels still dispatched are two no-op housekeeping kernels (a TP
+hand-written kernels still dispatched are two no-op housekeeping kernels (a GPU-clock
 keepalive and a warmup touch). Every other hand-written kernel is replaced by a
 one-line no-op stand-in so availability checks and preconditions behave as
 before; the build assembles the embedded kernel source from `prelude.metal` and
