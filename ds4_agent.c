@@ -5,7 +5,6 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_prompt_prefix.h"
-#include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
 
@@ -754,24 +753,6 @@ static agent_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
-        char tp_parse_err[256] = {0};
-        ds4_tp_cli_parse_result tp_parse =
-            ds4_tp_parse_cli_arg(arg,
-                                 &i,
-                                 argc,
-                                 argv,
-                                 &c.engine.tp,
-                                 tp_parse_err,
-                                 sizeof(tp_parse_err));
-        if (tp_parse == DS4_TP_CLI_ERROR) {
-            fprintf(stderr,
-                    "ds4-agent: %s\n",
-                    tp_parse_err[0] ? tp_parse_err :
-                    "invalid tensor-parallel option");
-            exit(2);
-        }
-        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
-
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
                 fprintf(stderr,
@@ -888,8 +869,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -963,14 +942,6 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
-    char tp_err[256];
-    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
-                                          &c.engine.distributed,
-                                          tp_err,
-                                          sizeof(tp_err))) {
-        fprintf(stderr, "ds4-agent: %s\n", tp_err);
-        exit(2);
-    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -979,14 +950,7 @@ static agent_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-agent: %s\n", dist_err);
         exit(2);
     }
-    if (!ds4_tp_validate_engine_options(&c.engine,
-                                        tp_err,
-                                        sizeof(tp_err))) {
-        fprintf(stderr, "ds4-agent: %s\n", tp_err);
-        exit(2);
-    }
-    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER ||
-        c.engine.tp.role == DS4_TP_WORKER) {
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
@@ -4883,12 +4847,6 @@ static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
     }
 }
 
-static bool agent_kv_payload_requires_rebuild(const agent_worker *w,
-                                              uint64_t payload_bytes) {
-    if (payload_bytes == 0) return true;
-    return w && w->cfg && ds4_tp_enabled(&w->cfg->engine.tp);
-}
-
 /* Load a KV file and optionally verify either its session identity or exact
  * rendered text.  sysprompt.kv uses exact text because the file name is fixed;
  * saved sessions use their filename SHA: modern agent sessions hash the title
@@ -4948,7 +4906,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
+    if (ok && hdr.payload_bytes == 0) {
         /* A saved payload contains only the leader's graph state. Rebuild from
          * rendered text under TP so session_sync mirrors the same token prefix
          * to the worker before either rank resumes decoding. */
@@ -8066,18 +8024,6 @@ static void test_agent_cache_rejects_impossible_lengths(void) {
     fclose(fp);
 }
 
-static void test_agent_tp_cache_payload_rebuild_policy(void) {
-    agent_config cfg = {0};
-    agent_worker w = {
-        .cfg = &cfg,
-    };
-
-    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 0));
-    AGENT_TEST_ASSERT(!agent_kv_payload_requires_rebuild(&w, 1));
-    cfg.engine.tp.role = DS4_TP_LEADER;
-    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 1));
-}
-
 static void test_agent_steering_command(void) {
     float scale = 0.0f;
     AGENT_TEST_ASSERT(parse_steering_level("-100", &scale) && scale == -100.0f);
@@ -8160,7 +8106,6 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_cache_rejects_impossible_lengths();
-    test_agent_tp_cache_payload_rebuild_policy();
     test_agent_steering_command();
     test_agent_read_default_lines_follow_context();
     test_agent_glm_template_policy();
@@ -13571,33 +13516,6 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 2;
     }
-    ds4_tp *tp_leader = NULL;
-    if (cfg.engine.tp.role == DS4_TP_LEADER) {
-        char tp_err[256] = "";
-        ds4_tp_identity tp_id = {
-            .gguf_bytes = ds4_engine_model_bytes(engine),
-            .model_id = (uint32_t)ds4_engine_model_id(engine),
-            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
-            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
-            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
-            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-            .ctx_size = (uint32_t)cfg.gen.ctx_size,
-        };
-        ds4_engine_tp_gate_schedule(engine,
-                                    &tp_id.gate_slot_start,
-                                    &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token,
-                                    tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
-                           tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
-            fprintf(stderr, "ds4-agent: %s\n", tp_err);
-            ds4_tp_free(tp_leader);
-            ds4_engine_close(engine);
-            return 1;
-        }
-    }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 
     /* Model paths and Metal kernel sources are resolved from the launch
@@ -13606,9 +13524,7 @@ int main(int argc, char **argv) {
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
-        if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
-        ds4_tp_free(tp_leader);
         return 1;
     }
 
@@ -13625,9 +13541,7 @@ int main(int argc, char **argv) {
         run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
-    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
-    ds4_tp_free(tp_leader);
     free(cfg.gen.prompt_owned);
     ds4_prompt_prefix_free(&cfg.gen.prefix);
     return rc;

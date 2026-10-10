@@ -2,7 +2,6 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
-#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -61,13 +60,11 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
-    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
-    bool cuda_tensor_parallel;
     bool show_output;
     bool teacher_forced_decode;
     bool dspark;
@@ -249,23 +246,6 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
-        char tp_parse_err[256] = {0};
-        ds4_tp_cli_parse_result tp_parse =
-            ds4_tp_parse_cli_arg(arg,
-                                 &i,
-                                 argc,
-                                 argv,
-                                 &c.tp,
-                                 tp_parse_err,
-                                 sizeof(tp_parse_err));
-        if (tp_parse == DS4_TP_CLI_ERROR) {
-            fprintf(stderr,
-                    "ds4-bench: %s\n",
-                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
-            exit(2);
-        }
-        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
-
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
@@ -322,8 +302,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            c.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -417,20 +395,12 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
-    char tp_err[256];
-    if (!ds4_tp_adopt_distributed_options(&c.tp,
-                                          &c.dist,
-                                          tp_err,
-                                          sizeof(tp_err))) {
-        fprintf(stderr, "ds4-bench: %s\n", tp_err);
-        exit(2);
-    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
         exit(2);
     }
-    if (c.dist.role == DS4_DISTRIBUTED_WORKER || c.tp.role == DS4_TP_WORKER) {
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
         fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
@@ -616,12 +586,6 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
-static void close_engine(ds4_engine *engine, ds4_tp *tp) {
-    if (tp) ds4_tp_send_stop(tp);
-    ds4_engine_close(engine);
-    ds4_tp_free(tp);
-}
-
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -663,22 +627,15 @@ int main(int argc, char **argv) {
         .dspark = cfg.dspark,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
-        .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
-        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
-        return 2;
-    }
-    char tp_err[256];
-    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
-        fprintf(stderr, "ds4-bench: %s\n", tp_err);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -696,33 +653,6 @@ int main(int argc, char **argv) {
                 &engine, &opt, &gpu_cfg) != 0) return 1;
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
-    }
-    ds4_tp *tp_leader = NULL;
-    if (cfg.tp.role == DS4_TP_LEADER) {
-        ds4_tp_identity tp_id = {
-            .gguf_bytes = ds4_engine_model_bytes(engine),
-            .model_id = (uint32_t)ds4_engine_model_id(engine),
-            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
-            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
-            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
-            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-            .ctx_size = (uint32_t)cfg.ctx_alloc,
-        };
-        ds4_engine_tp_gate_schedule(engine,
-                                    &tp_id.gate_slot_start,
-                                    &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token,
-                                    tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader,
-                           &cfg.tp,
-                           &tp_id,
-                           tp_err,
-                           sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
-            fprintf(stderr, "ds4-bench: %s\n", tp_err);
-            close_engine(engine, tp_leader);
-            return 1;
-        }
     }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
@@ -747,7 +677,7 @@ int main(int argc, char **argv) {
                 prompt_tokens_needed,
                 cfg.teacher_forced_decode ? " for teacher-forced decode" : "");
         ds4_tokens_free(&prompt);
-        close_engine(engine, tp_leader);
+        ds4_engine_close(engine);
         return 1;
     }
 
@@ -755,7 +685,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
-        close_engine(engine, tp_leader);
+        ds4_engine_close(engine);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -763,7 +693,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
-        close_engine(engine, tp_leader);
+        ds4_engine_close(engine);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -775,7 +705,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
-            close_engine(engine, tp_leader);
+            ds4_engine_close(engine);
             return 1;
         }
     }
@@ -784,15 +714,14 @@ int main(int argc, char **argv) {
 
     const int eos = ds4_token_eos(engine);
     const bool distributed =
-        cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
-        cfg.tp.role == DS4_TP_LEADER;
+        cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
     const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
     if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
-        close_engine(engine, tp_leader);
+        ds4_engine_close(engine);
         return 1;
     }
     if (speculative) {
@@ -1038,6 +967,6 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
-    close_engine(engine, tp_leader);
+    ds4_engine_close(engine);
     return rc;
 }

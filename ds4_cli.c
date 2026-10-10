@@ -1,7 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
-#include "ds4_tp.h"
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
@@ -547,7 +546,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         return 1;
     }
     /* Pay the one-time first-submission GPU cost before the prefill timer
-     * starts (matches the TP worker's startup warmup). */
+     * starts. */
     ds4_session_gpu_warmup(session);
 
     char err[160];
@@ -1238,14 +1237,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     } else {
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
-            cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
-            /* TP leaders always drive the session path: the sync/eval
-             * mirroring that keeps the worker in lockstep lives there.
-             * The env override exists so TP-vs-single-node validation
-             * compares like with like. */
             rc = run_sampled_generation(engine, cfg, &prompt);
         } else {
             token_printer printer = {
@@ -1968,20 +1962,6 @@ static cli_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
-        char tp_parse_err[256] = {0};
-        ds4_tp_cli_parse_result tp_parse = ds4_tp_parse_cli_arg(arg,
-                                                                &i,
-                                                                argc,
-                                                                argv,
-                                                                &c.engine.tp,
-                                                                tp_parse_err,
-                                                                sizeof(tp_parse_err));
-        if (tp_parse == DS4_TP_CLI_ERROR) {
-            fprintf(stderr, "ds4: %s\n", tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
-            exit(2);
-        }
-        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
-
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
                 fprintf(stderr, "ds4: specify only one prompt source\n");
@@ -2131,8 +2111,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -2238,19 +2216,9 @@ static cli_config parse_options(int argc, char **argv) {
                 "ds4: --prefix-file cannot be combined with an already-rendered prompt\n");
         exit(2);
     }
-    char tp_err[256];
-    if (!ds4_tp_adopt_distributed_options(&c.engine.tp, c.dist,
-                                          tp_err, sizeof(tp_err))) {
-        fprintf(stderr, "ds4: %s\n", tp_err);
-        exit(2);
-    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(c.dist, &c.engine, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4: %s\n", dist_err);
-        exit(2);
-    }
-    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
-        fprintf(stderr, "ds4: %s\n", tp_err);
         exit(2);
     }
 
@@ -2348,40 +2316,6 @@ int main(int argc, char **argv) {
         return 2;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
-    if (cfg.engine.tp.role == DS4_TP_WORKER) {
-        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
-        ds4_engine_close(engine);
-        ds4_dist_options_free(cfg.dist);
-        free(cfg.prompt_owned);
-        return rc;
-    }
-    ds4_tp *tp_leader = NULL;
-    if (cfg.engine.tp.role == DS4_TP_LEADER) {
-        char tp_err[256] = "";
-        ds4_tp_identity tp_id = {
-            .gguf_bytes = ds4_engine_model_bytes(engine),
-            .model_id = (uint32_t)ds4_engine_model_id(engine),
-            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
-            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
-            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
-            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-            .ctx_size = (uint32_t)cfg.gen.ctx_size,
-        };
-        ds4_engine_tp_gate_schedule(engine,
-                                    &tp_id.gate_slot_start,
-                                    &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token,
-                                    tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id, tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
-            fprintf(stderr, "ds4: %s\n", tp_err);
-            ds4_tp_free(tp_leader);
-            ds4_engine_close(engine);
-            ds4_dist_options_free(cfg.dist);
-            free(cfg.prompt_owned);
-            return 1;
-        }
-    }
     if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options dist_gen = {
             .prompt = cfg.gen.prompt,
@@ -2428,9 +2362,7 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
-    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
-    ds4_tp_free(tp_leader);
     ds4_dist_options_free(cfg.dist);
     ds4_prompt_prefix_free(&cfg.gen.prefix);
     free(cfg.prompt_owned);
