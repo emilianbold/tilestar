@@ -89,10 +89,8 @@ The size comes from compiling features out and letting the linker drop them
 (LTO plus `-ffunction-sections -fdata-sections` and `-Wl,-dead_strip`): other
 models, vision, Engram, SSD streaming, distributed mode and tensor parallelism,
 the CPU reference path, and the help text of the server. Code that only other
-models or removed features use is not deleted, to keep the diff against upstream
-small and the code readable; it is wrapped in `#ifdef DS4_UPSTREAM_FEATURES`
-(never defined here) so an editor can collapse it, with a few one-line stubs and
-declarations keeping the rest compiling.
+models or removed features used is deleted where it was cleanly separable; a few
+one-line stubs and declarations keep the rest compiling.
 
 TileLang kernels are always preferred at dispatch time. Every real op in the
 server flow on this machine, including DSpark, is TileLang-covered: the only
