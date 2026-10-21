@@ -27776,13 +27776,22 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             metal_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
-            const bool aligned_chunk =
+            /*
+             * Batch the aligned head of the chunk through the replay path and
+             * fall back to the per-token loop only for the ragged remainder
+             * (< ratio tokens: it can never complete a pooling window, so the
+             * loop emits nothing). Routing a whole ragged tail chunk through
+             * the per-token loop costs ~5 tiny dispatches per layer per token
+             * (store + pool + norm + rope + shift), almost all fixed overhead.
+             */
+            const uint32_t batched_tokens =
                 getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
                 !g->spec_capture_prefixes &&
-                (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
-            if (aligned_chunk) {
+                (pos0 % ratio) == 0u
+                    ? (n_tokens / ratio) * ratio : 0u;
+            if (batched_tokens != 0) {
                 const uint32_t comp_before = g->layer_n_comp[il];
-                const uint32_t comp_chunk = n_tokens / ratio;
+                const uint32_t comp_chunk = batched_tokens / ratio;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
@@ -27809,7 +27818,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             layer->attn_compressor_norm->type,
                             DS4_N_HEAD_DIM,
                             pos0,
-                            n_tokens,
+                            batched_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                             true,
@@ -27836,7 +27845,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             DS4_N_HEAD_DIM,
                             ratio,
                             pos0,
-                            n_tokens,
+                            batched_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                             true,
@@ -27862,7 +27871,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      DS4_N_HEAD_DIM,
                                                                      comp_width,
                                                                      pos0,
-                                                                     n_tokens);
+                                                                     batched_tokens);
                 }
                 if (ok) {
                     g->layer_n_comp[il] = comp_before + comp_chunk;
@@ -27888,8 +27897,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 metal_graph_attn_comp_prefill_target_free(attn_comp_target);
-            } else {
-                for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            }
+            /* ragged remainder (or the whole chunk when batching is off) */
+            {
+                for (uint32_t t = batched_tokens; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
@@ -28101,13 +28112,20 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
             } else {
-                const bool aligned_chunk =
+                /*
+                 * Same head/remainder split as the attention compressor above:
+                 * batch the aligned head, run the per-token loop only for the
+                 * ragged remainder (it emits nothing: the remainder is
+                 * smaller than one pooling window).
+                 */
+                const uint32_t batched_tokens =
                     getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
                     !g->spec_capture_prefixes &&
-                    (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
-                if (aligned_chunk) {
+                    (pos0 % ratio) == 0u
+                        ? (n_tokens / ratio) * ratio : 0u;
+                if (batched_tokens != 0) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
-                    const uint32_t index_chunk = n_tokens / ratio;
+                    const uint32_t index_chunk = batched_tokens / ratio;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
@@ -28135,7 +28153,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                 layer->indexer_compressor_norm->type,
                                 DS4_N_INDEXER_HEAD_DIM,
                                 pos0,
-                                n_tokens,
+                                batched_tokens,
                                 DS4_N_ROT,
                                 compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                 false,
@@ -28163,7 +28181,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                          DS4_N_INDEXER_HEAD_DIM,
                                                                          index_width,
                                                                          pos0,
-                                                                         n_tokens);
+                                                                         batched_tokens);
                     }
                     if (ok) {
                         g->layer_n_index_comp[il] = index_before + index_chunk;
@@ -28189,8 +28207,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       pos0);
                     }
                     ds4_gpu_tensor_free(index_view);
-                } else {
-                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                }
+                /* ragged remainder (or the whole chunk when batching is off) */
+                {
+                    for (uint32_t t = batched_tokens; ok && t < n_tokens; t++) {
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
